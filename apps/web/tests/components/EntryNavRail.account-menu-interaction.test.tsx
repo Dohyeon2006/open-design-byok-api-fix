@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { EntryNavRail, resetWorkspaceDirectoryCache } from '../../src/components/EntryNavRail';
 import { I18nProvider } from '../../src/i18n';
+import { WORKSPACE_CHROME_ACCOUNT_ACTIONS_ID } from '../../src/components/workspaceChromeActions';
 
 function teamContext(): WorkspaceCollabContext {
   return {
@@ -52,11 +53,19 @@ function stubFetch() {
   );
 }
 
+let chromeActionsHost: HTMLDivElement;
+
 beforeEach(() => {
   vi.useFakeTimers();
   localStorage.clear();
   resetWorkspaceDirectoryCache();
   stubFetch();
+  const chrome = document.createElement('header');
+  chrome.className = 'workspace-tabs-chrome';
+  chromeActionsHost = document.createElement('div');
+  chromeActionsHost.id = WORKSPACE_CHROME_ACCOUNT_ACTIONS_ID;
+  chrome.append(chromeActionsHost);
+  document.body.append(chrome);
 });
 
 afterEach(() => {
@@ -65,6 +74,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  document.querySelector('.workspace-tabs-chrome')?.remove();
 });
 
 async function advancePastHoverClose() {
@@ -74,6 +84,21 @@ async function advancePastHoverClose() {
 }
 
 describe('EntryNavRail account menu interaction state', () => {
+  it('mounts the top-right cluster in the chrome host and the account row in the rail', async () => {
+    renderRail();
+
+    await act(async () => {});
+    // The chrome's no-drag host carries the cluster (GitHub chip, credits
+    // pill); the identity row itself lives at the foot of the rail's nav
+    // column (per product: 账户移到左栏底部).
+    expect(screen.getByTestId('entry-top-right-github').closest('#workspace-chrome-account-actions'))
+      .toBe(chromeActionsHost);
+    const trigger = screen.getByTestId('entry-nav-account');
+    expect(trigger.closest('#workspace-chrome-account-actions')).toBeNull();
+    expect(trigger.closest('.entry-nav-rail__account-dock')).not.toBeNull();
+    expect(trigger.closest('.entry-nav-rail__group')).not.toBeNull();
+  });
+
   it('pins a hover-open menu when the avatar is clicked', async () => {
     renderRail();
     const trigger = screen.getByTestId('entry-nav-account');
@@ -155,9 +180,11 @@ describe('EntryNavRail account menu interaction state', () => {
     fireEvent.mouseEnter(trigger);
     fireEvent.click(trigger);
 
-    fireEvent.click(screen.getByRole('menuitem', { name: '设置' }));
+    // 设置 left the menu for the rail (it sits under 插件); 账单 is the menu's
+    // first row now, and it is a plain outbound link.
+    fireEvent.click(screen.getByRole('menuitem', { name: /账单/ }));
 
-    expect(onOpenSettings).toHaveBeenCalledOnce();
+    expect(onOpenSettings).not.toHaveBeenCalled();
     expect(trigger).toHaveAttribute('aria-expanded', 'false');
   });
 });

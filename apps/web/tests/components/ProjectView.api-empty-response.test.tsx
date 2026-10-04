@@ -144,6 +144,7 @@ vi.mock('../../src/state/projects', async () => {
   });
   return {
     ...actual,
+    cacheTabsLocally: vi.fn<typeof actual.cacheTabsLocally>((_projectId, state) => state),
     createConversation: vi.fn().mockImplementation(async (projectId: string) => mockConversation(projectId)),
     deleteConversation: vi.fn(),
     getTemplate: vi.fn().mockResolvedValue(null),
@@ -152,6 +153,7 @@ vi.mock('../../src/state/projects', async () => {
     loadTabs: vi.fn().mockResolvedValue({ tabs: [], active: null }),
     patchConversation: vi.fn(),
     patchProject: vi.fn(),
+    persistTabsToDaemonNow: vi.fn().mockResolvedValue(undefined),
     saveMessage: vi.fn(),
     saveTabs: vi.fn(),
   };
@@ -377,6 +379,7 @@ describe('ProjectView API empty response handling', () => {
     mockedFetchProjectFilePreview.mockReset();
     mockedFetchProjectFileText.mockReset();
     mockedFetchProjectFiles.mockReset();
+    mockedWriteProjectTextFile.mockReset();
     mockedFetchProjectFilePreview.mockResolvedValue(null);
     mockedFetchProjectFileText.mockResolvedValue(null);
     mockedFetchProjectFiles.mockResolvedValue([]);
@@ -412,7 +415,7 @@ describe('ProjectView API empty response handling', () => {
     await waitFor(() => {
       expect(screen.getByText('empty_response:deepseek-chat')).toBeTruthy();
     });
-    expect(screen.getByText(/provider ended the request/i)).toBeTruthy();
+    expect(screen.getByText('This task failed to run. Please retry. If it fails again, please contact support.')).toBeTruthy();
     expect(screen.queryByText('succeeded')).toBeNull();
 
     await waitFor(() => {
@@ -835,7 +838,7 @@ describe('ProjectView API empty response handling', () => {
     expect(screen.getByText('canceled')).toBeTruthy();
   });
 
-  it('keeps a direct API stop cancelled when the provider completes after abort', async () => {
+  it('keeps a direct API stop cancelled when the provider emits late callbacks after abort', async () => {
     const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
     vi.stubGlobal('fetch', fetchMock);
     let providerSignal: AbortSignal | undefined;
@@ -845,6 +848,12 @@ describe('ProjectView API empty response handling', () => {
         signal.addEventListener(
           'abort',
           () => {
+            handlers.onDelta(
+              '<artifact identifier="late" type="text/html" title="Late output">' +
+              '<!doctype html><html><head><title>Late</title></head><body><main><h1>Late output</h1><p>This output arrived only after the user stopped the run.</p></main></body></html>' +
+              '</artifact>',
+            );
+            handlers.onError(new Error('late provider error'));
             handlers.onDone('late success');
             resolve();
           },
@@ -874,6 +883,8 @@ describe('ProjectView API empty response handling', () => {
       artifact_count: 0,
     });
     expect(screen.queryByText('late success')).toBeNull();
+    expect(screen.queryByText('late provider error')).toBeNull();
+    expect(mockedWriteProjectTextFile).not.toHaveBeenCalled();
     expect(screen.getByText('canceled')).toBeTruthy();
   });
 
@@ -1009,6 +1020,88 @@ describe('ProjectView API empty response handling', () => {
     });
   });
 
+  it.each([
+    { outcome: 'saved', persisted: true, artifactCount: 1 },
+    { outcome: 'not delivered', persisted: false, artifactCount: 0 },
+  ])('counts an existing direct API artifact only after its update is $outcome', async ({ persisted, artifactCount }) => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async () => Response.json({})));
+    const existingArtifact: ProjectFile = {
+      name: 'index.html',
+      path: 'index.html',
+      kind: 'html',
+      mime: 'text/html',
+      size: 100,
+      mtime: 1,
+      artifactManifest: {
+        version: 1,
+        kind: 'html',
+        title: 'Home',
+        entry: 'index.html',
+        renderer: 'html',
+        exports: ['html'],
+        metadata: { identifier: 'index', inferred: false },
+      },
+    };
+    const updatedArtifact = { ...existingArtifact, size: 200, mtime: 2 };
+    const updatedHtml =
+      '<!doctype html><html><head><title>Updated Home</title></head><body><main><h1>Updated home page</h1><p>Complete replacement content for the existing project entry.</p></main></body></html>';
+    let projectFiles = [existingArtifact];
+    let releaseWrite!: (file: ProjectFile | null) => void;
+    const writeGate = new Promise<ProjectFile | null>((resolve) => { releaseWrite = resolve; });
+    mockedFetchProjectFiles.mockImplementation(async () => projectFiles);
+    mockedWriteProjectTextFile.mockImplementation(async () => {
+      const file = await writeGate;
+      if (file) projectFiles = [file];
+      return file;
+    });
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+      handlers.onDelta(
+        '<artifact identifier="index" type="text/html" title="Updated Home">' +
+        updatedHtml +
+        '</artifact>',
+      );
+      handlers.onDone('');
+    });
+    renderProjectView(project, [{
+      id: 'byok-opencode',
+      name: 'BYOK OpenCode',
+      bin: 'opencode',
+      available: false,
+      models: [],
+    } as AgentInfo]);
+
+    const writeResult = persisted ? updatedArtifact : null;
+    try {
+      await sendTestPrompt();
+      await waitFor(() => expect(mockedWriteProjectTextFile).toHaveBeenCalledTimes(1));
+      expect(mockedWriteProjectTextFile.mock.calls[0]?.slice(0, 3)).toEqual([
+        project.id,
+        'index.html',
+        updatedHtml,
+      ]);
+      expect(mockedTrackRunFinished).not.toHaveBeenCalled();
+
+      releaseWrite(writeResult);
+
+      await waitFor(() => expect(mockedTrackRunFinished).toHaveBeenCalledTimes(1));
+      expect(mockedTrackRunFinished.mock.calls[0]?.[1]).toMatchObject({
+        result: 'success',
+        artifact_count: artifactCount,
+        ...(persisted ? { primary_artifact_change: 'modified' } : {}),
+      });
+      await waitFor(() => expect(hasSavedAssistantMessage((message) => (
+        message.runStatus === 'succeeded' &&
+        message.resultDeliveryState === (persisted ? 'delivered' : 'delivery_failed')
+      ))).toBe(true));
+      if (!persisted) {
+        expect(screen.getAllByText(/couldn't save artifact/i).length).toBeGreaterThan(0);
+      }
+    } finally {
+      // Unblock the finalizer even if an earlier assertion fails.
+      releaseWrite(writeResult);
+    }
+  });
+
   it('does not include saved project instructions in the BYOK system prompt', async () => {
     const capturedOptions: { current: DaemonStreamOptions | null } = { current: null };
     mockedStreamViaDaemon.mockImplementation(async (options: DaemonStreamOptions) => {
@@ -1035,7 +1128,7 @@ describe('ProjectView API empty response handling', () => {
   it('does not expose the project instructions editor from the project header', async () => {
     const view = renderProjectView();
 
-    await screen.findByTestId('project-title');
+    await screen.findByTestId('file-workspace');
 
     expect(screen.queryByTestId('project-instructions-add')).toBeNull();
     expect(view.container.querySelector('.project-instructions-chip')).toBeNull();
@@ -1097,7 +1190,7 @@ describe('ProjectView API empty response handling', () => {
     });
     await waitFor(() => expect(mockedPlaySound).toHaveBeenCalledWith('success-sound'));
     expect(mockedPlaySound).not.toHaveBeenCalledWith('failure-sound');
-    expect(screen.queryByText(/provider ended the request/i)).toBeNull();
+    expect(screen.queryByText('This task failed to run. Please retry. If it fails again, please contact support.')).toBeNull();
     expect(screen.queryByText('empty_response:deepseek-chat')).toBeNull();
   });
 
@@ -1431,6 +1524,7 @@ async function sendTestPrompt(
       expectedProjectId,
       `conv-${expectedProjectId}`,
       expectedWorkspaceContext,
+      expect.any(AbortSignal),
     );
   });
   await new Promise((resolve) => setTimeout(resolve, 0));
