@@ -708,12 +708,86 @@ describe('ProjectView API empty response handling', () => {
       .filter(([url]) => url === '/api/memory/extract')
       .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>);
     expect(memoryRequests).toHaveLength(2);
+    const assistantId = mockedSaveMessage.mock.calls.find(
+      ([, , message]) => message.role === 'assistant',
+    )?.[2].id;
+    expect(typeof assistantId).toBe('string');
+    expect(memoryRequests).toEqual([
+      expect.objectContaining({
+        projectId: project.id,
+        conversationId: `conv-${project.id}`,
+        assistantMessageId: assistantId,
+      }),
+      expect.objectContaining({
+        projectId: project.id,
+        conversationId: `conv-${project.id}`,
+        assistantMessageId: assistantId,
+        assistantMessage: 'hello',
+      }),
+    ]);
     expect(memoryRequests.every((request) => (
       typeof request.chatProvider === 'object' &&
       request.chatProvider !== null &&
       (request.chatProvider as Record<string, unknown>).provider === 'openai'
     ))).toBe(true);
     expect(memoryRequests.every((request) => !('byokChatProvider' in request))).toBe(true);
+  });
+
+  it('keeps late direct memory extraction bound to its sending draft after another turn starts', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => Response.json({}));
+    vi.stubGlobal('fetch', fetchMock);
+    let releaseFirstProvider: (() => void) | undefined;
+    const firstProviderSettled = new Promise<void>((resolve) => {
+      releaseFirstProvider = resolve;
+    });
+    let turn = 0;
+    mockedStreamMessage.mockImplementation(async (_config, _system, _history, _signal, handlers) => {
+      turn += 1;
+      const response = turn === 1 ? 'first response' : 'second response';
+      handlers.onDelta(response);
+      handlers.onDone(response);
+      if (turn === 1) await firstProviderSettled;
+    });
+    renderProjectView(project, [{
+      id: 'byok-opencode',
+      name: 'BYOK OpenCode',
+      bin: 'opencode',
+      available: false,
+      models: [],
+    } as AgentInfo]);
+    const memoryRequests = () => fetchMock.mock.calls
+      .filter(([url]) => url === '/api/memory/extract')
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>);
+
+    try {
+      await sendTestPrompt();
+      await waitFor(() => expect(hasSavedAssistantMessage((message) => (
+        message.content === 'first response' && message.runStatus === 'succeeded'
+      ))).toBe(true));
+      const firstAssistantId = mockedSaveMessage.mock.calls.find(
+        ([, , message]) => message.role === 'assistant',
+      )?.[2].id;
+      expect(typeof firstAssistantId).toBe('string');
+
+      await sendTestPrompt();
+      await waitFor(() => expect(memoryRequests()).toHaveLength(3));
+      const secondAssistantId = mockedSaveMessage.mock.calls.find(
+        ([, , message]) => message.role === 'assistant' && message.id !== firstAssistantId,
+      )?.[2].id;
+      expect(typeof secondAssistantId).toBe('string');
+      expect(secondAssistantId).not.toBe(firstAssistantId);
+
+      releaseFirstProvider?.();
+      await waitFor(() => expect(memoryRequests()).toHaveLength(4));
+      expect(memoryRequests()).toEqual([
+        expect.objectContaining({ assistantMessageId: firstAssistantId }),
+        expect.objectContaining({ assistantMessageId: secondAssistantId }),
+        expect.objectContaining({ assistantMessageId: secondAssistantId, assistantMessage: 'second response' }),
+        expect.objectContaining({ assistantMessageId: firstAssistantId, assistantMessage: 'first response' }),
+      ]);
+    } finally {
+      releaseFirstProvider?.();
+    }
   });
 
   it.each(['senseaudio', 'aihubmix'] as const)(
@@ -767,6 +841,9 @@ describe('ProjectView API empty response handling', () => {
     expect(memoryRequest).toBeTruthy();
     const body = JSON.parse(String((memoryRequest?.[1] as RequestInit).body)) as Record<string, unknown>;
     expect(body).toMatchObject({
+      projectId: project.id,
+      conversationId: `conv-${project.id}`,
+      assistantMessageId: mockedStreamViaDaemon.mock.calls[0]?.[0].assistantMessageId,
       chatProvider: {
         provider: 'openai',
         model: 'deepseek-chat',
